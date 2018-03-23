@@ -14,10 +14,11 @@
 umask 0077
 
 # path to eapol test
-EAPOL_PROG=/usr/local/bin/eapol_test
+EAPOL_PROG=$(dirname "$0")/eapol_test
 
 # default verbosity
 VERBOSE=0
+FILTER_OUT=0
 
 # debug script
 DEBUG=1
@@ -51,7 +52,7 @@ if [ ! -x "$EAPOL_PROG" ]; then # exact path?
     fi
 fi
 
-TEMP=`getopt -o H:P:S:u:p:t:m:s:e:t:M:i:d:j:k:a:A:l:2:x:vcNO:I:Cfh -- "$@"`
+TEMP=`getopt -o H:P:S:u:p:t:m:s:e:t:M:i:d:j:k:a:A:l:2:x:vcNO:I:X:CVh -- "$@"`
 
 myhelp() {
   echo "# wrapper script around eapol_test from wpa_supplicant project 
@@ -84,6 +85,8 @@ Parameters :
 -O <domain.edu.cctld> - Operator-Name value in domain name format
 -I <ip address> - explicitly specify NAS-IP-Address
 -C - request Chargeable-User-Identity
+-V - Show received Chargeable-User-Identity and/or Operator-Name
+-X <warn_days> - check certificate expiry
 -f - send big access-request to cause fragmentation
 -h - show this message
 " >&2; 
@@ -126,6 +129,8 @@ while true ; do
     -I) NAS_IP_ADDRESS=$2; shift 2;;
     -C) REQUEST_CUI="YES"; shift ;;
     -f) FRAGMENT="YES"; shift ;;
+    -V) VERBOSE=1; FILTER_OUT=1; shift ;;
+    -X) CERTIFICATE_EXPIRY=$2; shift 2;;
     -h) myhelp; shift ;;
     --) break ;;
     *) echo "Unknown option"; shift ;;  # I mean that getopt throws out unrecongized options, therefore this line cannot be running
@@ -181,13 +186,13 @@ if [ "$EAP" = "TLS" ]; then
 	fi
 else
   
-  if [ -z $PASSWORD ]; then
+  if [ -z "$PASSWORD" ]; then
     echo "Password is not specified. (option -p)"
     exit 3;
   fi
 fi
 
-if [ -z $METHOD ]; then
+if [ -z "$METHOD" ]; then
   echo "Method is not specified. (option -m)"
   exit 3;
 fi
@@ -202,6 +207,7 @@ fi
 if [ -z $SSID ]; then
 	SSID="eduroam";
 fi
+#EXTRA_EAPOL_ARGS="$EXTRA_EAPOL_ARGS -N30:s:$MAC:eduroam"
 
 if [ -z $PHASE2 ]; then
 	PHASE2="MSCHAPV2"
@@ -256,6 +262,11 @@ OUT2=$CONF.out2
 
 #echo $CONF $OUT
 
+# record the cert if we want to check expiry
+if [ -n "$CERTIFICATE_EXPIRY" ] ; then
+	EXTRA_EAPOL_ARGS="$EXTRA_EAPOL_ARGS -o$CONF.pem"
+fi
+
 # generation of configuration
 echo "network={" > $CONF
 echo "  ssid=\"$SSID\"" >> $CONF
@@ -303,6 +314,7 @@ garbage() {
 	if [ $CLEANUP -eq 1 ]; then
     # exception occur => remove files
 		rm $CONF $OUT
+		if [ -n "$CERTIFICATE_EXPIRY" ] ; then rm $CONF.pem ; fi
 		rmdir $MYTMPDIR
 	else 
 	  if [ $CLEANUP -eq 0 ]; then
@@ -345,32 +357,61 @@ TU=$(echo "$T * 1000" | bc)
 #rm $CONF
 #cp $CONF test.conf
 
+
 if [ $VERBOSE -eq 1 ]; then
-	grep -A 100 "(Access-Accept)" $OUT2 > $OUT
+	if [ $FILTER_OUT -eq 1 ] ; then
+		# Show Operator-Name and Chargeable-User-Identity
+		grep -A 100 "(Access-Accept)" $OUT2 | awk '/Attribute (89|126) / { a=$3 } /Value: / && a { print a " " $2; a="" }' > $OUT
+	else
+		grep -A 100 "(Access-Accept)" $OUT2 > $OUT
+	fi
 	rm $OUT2
 fi
 
 # processing of return code
 # Successfull authentication
 if [ $RETURN_CODE -eq $RET_SUCC ]; then
-  printf "access-accept; %0.2f sec " $T
-  printf "|rtt=%0.0fms;;;0;%d accept=1;0.5:;0:;0;1\n" $TU $((TIMEOUT * 1000))
-  if [ $VERBOSE -gt 0 ]; then
-	  cat $OUT
+  rc=0
+  if [ -n "$CERTIFICATE_EXPIRY" ] ; then
+	EXPIRY_NOW=$(date +%s)
+	EXPIRY_WARN=$(( $NOW + ( $CERTIFICATE_EXPIRY * 86400 ) ))
+	for date in $(openssl crl2pkcs7 -nocrl -certfile $CONF.pem | openssl pkcs7 -print_certs -noout -text | grep 'Not After :' | sed -E 's/^.*Not After[[:space:]]*://' | xargs -I@ date -d '@' '+%s') ; do
+		if [ $date -lt $EXPIRY_NOW ] ; then
+			printf "CRITICAL: certificate EXPIRED %s\n" $(date -d "@$date" -Idate)
+			rc=2; break
+		else
+			if [ $date -lt $EXPIRY_WARN ] ; then
+				printf "WARNING: a cerificates expires soon (%s)\n" $(date -d "@$date" -Idate)
+				rc=1
+			fi
+		fi
+	done
+#	for subject in  $(openssl crl2pkcs7 -nocrl -certfile $CONF.pem | openssl pkcs7 -print_certs -noout -text | grep 'Subject: .*CN=\*\.' | sed -E 's/^.*Subject: .*CN=([^,]+).*/\1/') ; do
+#		printf "WARNING: certificate %s contains a wildcard subject\n" $subject
+#		if [ $rc -lt 2 ] ; then rc=1; fi
+#	done
   fi
 
+  printf "access-accept; %0.2f sec " $T
+  if [ $VERBOSE -gt 0 ]; then
+	  printf "\n";
+	  cat $OUT
+  fi
+  printf "|rtt=%0.0fms;;;0;%d accept=1;0.5:;0:;0;1\n" $TU $((TIMEOUT * 1000))
+
   garbage
-  exit 0;
+  exit ${rc};
 fi
 
 # Bad name or password
 # string "CTRL-EVENT-EAP-FAILURE EAP authentication failed"
 if [ $RETURN_CODE -eq $RET_EAP_FAILED ]; then
   printf "access-reject; %0.2f sec " $T
-  printf "|rtt=%0.0fms;;;0;%d accept=0.5;0.5:;0:;0;1\n" $TU $((TIMEOUT * 1000))
   if [ $VERBOSE -gt 0 ]; then
+	  printf "\n";
 	  cat $OUT
   fi
+  printf "|rtt=%0.0fms;;;0;%d accept=0.5;0.5:;0:;0;1\n" $TU $((TIMEOUT * 1000))
 
   garbage
   exit 1;
@@ -380,10 +421,11 @@ fi
 # timeout string "EAPOL test timed out"
 if [ $RETURN_CODE -eq $RET_RADIUS_NOT_AVAIL ]; then
   printf "timeout; %0.0f sec " $T
-  printf "|rtt=%0.0fms;;;0;%d accept=0;0.5:;0:;0;1\n" $TU $((TIMEOUT * 1000))
   if [ $VERBOSE -gt 0 ]; then
+	  printf "\n";
 	  cat $OUT
   fi
+  printf "|rtt=%0.0fms;;;0;%d accept=0;0.5:;0:;0;1\n" $TU $((TIMEOUT * 1000))
 
   garbage
   exit 2;
